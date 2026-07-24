@@ -19,9 +19,9 @@ Configuration reaches a consumer application through exactly two channels:
 
 Consequences the gem MUST honor:
 
-- Redis is a **cache of the env truth**, not an override layer. When Redis and boot-time ENV
-  disagree, Redis is the FRESHER value and wins reads; when Redis is unavailable or has no
-  key, boot-time ENV is the correct fallback ("as deployed").
+- Redis is a **cache of the env truth**, not an override layer. When Redis and the boot-time
+  value disagree, Redis is the FRESHER value and wins reads; when Redis is unavailable or has
+  no key, the boot-time value is the correct fallback ("as deployed").
 - The consumer **NEVER writes Redis** — see invariant I1.
 - Reconciliation of env↔Redis drift is the fleet's job, never the consumer's.
 
@@ -58,9 +58,9 @@ typed reads. Illustrative (naming is the implementor's; semantics are normative)
 
 ```ruby
 ArcaConfig.configure do |c|
-  c.redis_url = ENV["ARCA_CONFIG_REDIS_URL"]   # absent => Redis-less degraded mode
-  c.app       = "boss"
-  c.instance  = "dev2"
+  c.redis_url = ENV["ARCA_CONFIG_REDIS_URL"]        # absent => Redis-less degraded mode
+  c.app       = "boss"                              # a property of the CODEBASE — literal is fine
+  c.instance  = ENV.fetch("ARCA_CONFIG_INSTANCE")   # a property of the STAND — NEVER a literal
 
   c.key "FEATURE1_ENABLED",            :boolean
   c.key "AUTO_LOGOUT_TIMEOUT_SECONDS", :integer
@@ -72,17 +72,24 @@ ArcaConfig.fetch("AUTO_LOGOUT_TIMEOUT_SECONDS")  # => Integer
 
 - `redis_url` comes from an environment variable provided at deploy time (on dokku,
   `dokku redis:link` injects one; the exact variable name is deployment configuration).
+- `instance` MUST come from a deploy-time environment variable (e.g. `ARCA_CONFIG_INSTANCE`,
+  itself distributed as a static key): the same codebase runs on many stands, and a hardcoded
+  instance would silently read another stand's namespace. A consumer on a stand that does not
+  define the variable may skip `configure` entirely and keep reading plain ENV — the gem is
+  then simply not in play.
 - Reading a key that was not declared raises an error — that is a programming error, not a
   runtime condition (I4).
-- At boot, every declared key MUST resolve from at least boot-time ENV; a key resolvable
-  nowhere fails the boot loudly (I5). Redis reachability is NOT required at boot (I2).
+- At boot, every declared key MUST resolve — from Redis or from boot-time ENV — to a valid
+  typed value; a key resolvable nowhere fails the boot loudly (I5). The resolved result is the
+  key's **boot-time value** (Redis preferred when it holds a valid value, ENV otherwise) and
+  serves as the permanent fallback of §5. Redis reachability is NOT required at boot (I2).
 
 ## 5. Read semantics
 
 A read of a declared key resolves through this chain, first hit wins:
 
 ```
-request-scoped snapshot  →  per-process TTL cache (~5 s)  →  Redis GET  →  boot-time ENV
+request-scoped snapshot  →  per-process TTL cache (~5 s)  →  Redis GET  →  boot-time value
 ```
 
 1. **Request-scoped snapshot.** Within one web request all reads of all keys return the values
@@ -93,8 +100,9 @@ request-scoped snapshot  →  per-process TTL cache (~5 s)  →  Redis GET  → 
    thread-safe in-process cache with a TTL of ~5 seconds. The TTL bounds staleness: a flipped
    value is observed within one TTL. No pub/sub in v1 (see §8).
 3. **Redis GET** of `arca:config:<app>:<instance>:<KEY>` on cache miss.
-4. **Boot-time ENV** — the value of `ENV[<KEY>]` captured at process start — when Redis is
-   unreachable, the key is absent in Redis, or the Redis value is garbage (§3).
+4. **Boot-time value** — what the key resolved to at declaration time (Redis first, then
+   `ENV[<KEY>]`, both captured at process start; see §4) — when Redis is unreachable, the key
+   is absent in Redis, or the Redis value is garbage (§3).
 
 Concurrency requirements:
 
@@ -108,9 +116,10 @@ Concurrency requirements:
   boot-time ENV is a process-start snapshot; writing it anywhere would overwrite fresher
   values. This is a structural invariant, not a configuration default.
 - **I2 — Redis optional at boot.** The application boots and serves with Redis absent,
-  unreachable, or empty; behavior degrades exactly to "as deployed" (boot-time ENV).
-- **I3 — garbage never raises.** A value that fails its type's parse rule falls back to
-  boot-time ENV and logs ONE warning; it never raises at read time. A broken flag flip must
+  unreachable, or empty; behavior degrades exactly to "as deployed" (the boot-time values,
+  which without Redis are pure boot-time ENV).
+- **I3 — garbage never raises.** A value that fails its type's parse rule falls back to the
+  boot-time value and logs ONE warning; it never raises at read time. A broken flag flip must
   not take production down.
 - **I4 — undeclared key is an error.** Reading a key absent from the declaration raises.
 - **I5 — boot fail-fast.** A declared key that resolves neither from Redis nor from boot-time
@@ -122,11 +131,11 @@ Concurrency requirements:
 
 | Condition                    | Behavior                                                                 |
 | ---------------------------- | ------------------------------------------------------------------------ |
-| Redis down at boot           | boot proceeds (I2); reads serve boot-time ENV                            |
-| Redis becomes unreachable    | log ONCE, enter cool-down (no per-read connection storms), serve ENV     |
+| Redis down at boot           | boot proceeds (I2); reads serve boot-time values                         |
+| Redis becomes unreachable    | log ONCE, enter cool-down (no per-read connection storms), serve boot-time values |
 | Redis recovers               | next read after cool-down resumes the normal chain                       |
-| Garbage value in Redis       | ENV fallback + one warning log per key per process (I3); the fallback result is cached for the normal TTL window (no per-read re-fetch) |
-| Key missing in Redis         | ENV fallback, silent — a dynamic key may simply be unset yet             |
+| Garbage value in Redis       | boot-time fallback + one warning log per key per process (I3); the fallback result is cached for the normal TTL window (no per-read re-fetch) |
+| Key missing in Redis         | boot-time fallback, silent — a dynamic key may simply be unset yet       |
 | Key missing everywhere       | impossible after boot (I5 checked it); at boot — fail-fast               |
 
 "Log once" means once per failure episode per process, not once per read.
