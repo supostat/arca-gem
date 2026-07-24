@@ -19,9 +19,9 @@ Configuration reaches an application through exactly two channels:
   observes the change through Redis without a restart; any later restart boots with the
   same value from the environment.
 
-Redis is a *cache of the environment truth*, not an override layer: when Redis and
-boot-time ENV disagree, Redis is the fresher value and wins reads; when Redis is
-unavailable or has no key, boot-time ENV is the correct fallback ("as deployed").
+Redis is a *cache of the environment truth*, not an override layer: when Redis and the
+boot-time value disagree, Redis is the fresher value and wins reads; when Redis is
+unavailable or has no key, the boot-time value is the correct fallback ("as deployed").
 
 The consumer **never writes to Redis**. There is no write code path in this gem — the
 Redis adapter exposes a single `get` method, and a named spec pins that invariant.
@@ -43,9 +43,9 @@ Declare the key schema once at boot (for Rails, an initializer):
 
 ```ruby
 ArcaConfig.configure do |config|
-  config.redis_url = ENV["ARCA_CONFIG_REDIS_URL"] # absent => Redis-less degraded mode
-  config.app       = "boss"
-  config.instance  = "dev2"
+  config.redis_url = ENV["ARCA_CONFIG_REDIS_URL"]      # absent => Redis-less degraded mode
+  config.app       = "boss"                            # a property of the codebase — literal is fine
+  config.instance  = ENV.fetch("ARCA_CONFIG_INSTANCE") # a property of the stand — never a literal
 
   config.key "FEATURE1_ENABLED",            :boolean
   config.key "AUTO_LOGOUT_TIMEOUT_SECONDS", :integer
@@ -57,7 +57,12 @@ end
   deployment configuration.
 - `redis_url` normally comes from an environment variable injected at deploy time (on
   dokku, `dokku redis:link` provides one). When it is absent the gem runs in degraded
-  mode: every read serves the boot-time ENV value.
+  mode: every read serves the boot-time value.
+- `instance` must come from a deploy-time environment variable (e.g.
+  `ARCA_CONFIG_INSTANCE`, itself distributed as a static key): the same codebase runs on
+  many stands, and a hardcoded instance would silently read another stand's namespace. A
+  consumer on a stand that does not define the variable may skip `configure` entirely and
+  keep reading plain ENV — the gem is then simply not in play.
 - `config.key NAME, TYPE` declares one key. `NAME` must match `[A-Z][A-Z0-9_]{0,127}`;
   `TYPE` is `:boolean`, `:integer` or `:string`. Declaring the same key twice, an invalid
   name, or an unknown type raises `ArcaConfig::DeclarationError`.
@@ -80,8 +85,12 @@ A key that resolves nowhere fails the boot with `ArcaConfig::BootValidationError
 the key. Garbage in boot-time ENV (for example `FEATURE1_ENABLED=yes`) counts as
 unresolved and fails the boot too.
 
+The resolved result is the key's **boot-time value** (Redis preferred when it holds a
+valid value, ENV otherwise) and serves as the permanent fallback of the read chain.
+
 Redis reachability is **not** required at boot: with Redis absent, unreachable or empty,
-the application boots and serves values exactly "as deployed" from boot-time ENV.
+the application boots and serves values exactly "as deployed" — the boot-time values,
+which without Redis are pure boot-time ENV.
 
 ## Reading values
 
@@ -102,7 +111,7 @@ ArcaConfig.fetch("SOME_STRING_KEY")              # => String
 A read resolves through this chain, first hit wins:
 
 ```
-test stub  →  request/job snapshot  →  per-process TTL cache (~5 s)  →  Redis GET  →  boot-time ENV
+test stub  →  request/job snapshot  →  per-process TTL cache (~5 s)  →  Redis GET  →  boot-time value
 ```
 
 1. **Test stub** — active only inside an `ArcaConfig.stub` block (see below).
@@ -112,8 +121,9 @@ test stub  →  request/job snapshot  →  per-process TTL cache (~5 s)  →  Re
    observed within one TTL (~5 seconds by default). There is no pub/sub in v1; the TTL is
    the propagation bound.
 4. **Redis GET** of `arca:config:<app>:<instance>:<KEY>` on cache miss.
-5. **Boot-time ENV** — when Redis is unreachable, the key is absent in Redis, or the
-   Redis value is garbage.
+5. **Boot-time value** — what the key resolved to at declaration time (Redis first, then
+   `ENV[<KEY>]`, both captured at process start) — when Redis is unreachable, the key is
+   absent in Redis, or the Redis value is garbage.
 
 ### Value format
 
@@ -134,7 +144,7 @@ A broken flag flip must not take production down, so garbage never raises at rea
 
 | Condition | Behavior |
 | --- | --- |
-| Redis down at boot | boot proceeds; reads serve boot-time ENV |
+| Redis down at boot | boot proceeds; reads serve boot-time values |
 | Redis becomes unreachable | one warning log, cool-down (no per-read connection storms), reads serve boot-time values |
 | Redis recovers | the first read after cool-down resumes the normal chain |
 | Garbage value in Redis | fallback + one warning per key per process; the fallback is cached for the normal TTL window |
@@ -143,10 +153,6 @@ A broken flag flip must not take production down, so garbage never raises at rea
 
 "One warning" means once per failure episode per process, not once per read: a recovered
 and re-broken connection logs again.
-
-The fallback target is the *boot-resolved* value — the value each key resolved to at
-`configure` time (from Redis or ENV, whichever answered). For the common case of a valid
-ENV variable this is exactly the boot-time ENV value.
 
 ## Request and job snapshots
 
