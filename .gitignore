@@ -1,0 +1,3 @@
+.vscode
+docs/*
+!docs/CONTRACT.md
